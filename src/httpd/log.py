@@ -146,7 +146,7 @@ class HttpdLog(Iterable):
     RE_LINE = re.compile(
         r'\[(?P<timestamp>[^]]+)] '
         '\[(?P<module>\S+):(?P<level>\S+)] '
-        '\[pid (?P<pid>\d+):tid (?P<tid>\d+)] '
+        '\[pid (?P<pid>\d+)(:tid (?P<tid>\d+))?] '
         '((?P<source>\S+): )?'
         '(\[client (?P<client>\S+)] )?'
         '(?P<message>.*)')

@@ -30,15 +30,20 @@ class H2WorkerStatistics:
     def clear(self):
         self._changes.clear()
 
+    def has_data(self):
+        return len(self._changes) > 0
+
     def update(self):
         self.clear()
         for s in self.collector.all_streams():
+            if s.stream_id == 0:
+                continue
             started = s.event('started')
             ended = s.event('ended')
             if started:
                 self._changes.append(H2WorkerChange(started.timedelta, +1, s.started))
-            if ended:
-                self._changes.append(H2WorkerChange(ended.timedelta, -1, s.ended))
+                if ended:
+                    self._changes.append(H2WorkerChange(ended.timedelta, -1, s.ended))
         self._changes = sorted(self._changes, key=lambda c: c.timedelta)
 
     def in_use_at(self, t: timedelta):
@@ -72,22 +77,44 @@ class H2StreamLifetimeTable:
     def print_list(self, streams: List[H2StreamEvents], title: str):
         print(title)
         print(f"{'id':16} {'created':<28} {'scheduled':^18} {'started':^18} "
-              f"{'ended':^18} {'reset':^18} {'cleanup':^18} {'destroyed':^18}")
+              f"{'response':^18} {'ended':^18} {'reset':^18} {'cleanup':^18} "
+              f"{'error':>7}")
         for s in streams:
-            print(f"{s.gid:16} {str(s.event('created').timestamp):24}"
-                  f"{self.wstats.in_use_at(s.event('created').timedelta):>2}w "
+            print(f"{s.gid:16} "
+                  f"{self.tabs(s, 'created')}"
                   f"{self.tdelta(s, s.event('scheduled')):>18} "
-                  f"{self.tdelta(s, s.event('started')):>18} "
-                  f"{self.tdelta(s, s.event('ended')):>18} "
+                  f"{self.tdelta(s, s.event('started'), with_wstats=True):>18} "
+                  f"{self.tdelta(s, s.event('response')):>18} "
+                  f"{self.tdelta(s, s.event('ended'), with_wstats=True):>18} "
                   f"{self.tdelta(s, s.event('reset')):>18} "
                   f"{self.tdelta(s, s.event('cleanup')):>18} "
-                  f"{self.tdelta(s, s.event('destroyed')):>18} ")
+                  f"{self._error(s, s.event('error')):>7} "
+                  )
 
-    def tdelta(self, s: H2StreamEvents, e: HttpdLogEntry):
+    def tabs(self, s: H2StreamEvents, name: str, with_wstats=False):
+        e = s.event(name)
+        if e is None:
+            return '--'
+        if with_wstats and self.wstats.has_data():
+            return f"{str(e.timestamp)} {self.wstats.in_use_at(e.timedelta):2}w"
+        else:
+            return f"{str(e.timestamp)}"
+
+    def tdelta(self, s: H2StreamEvents, e: HttpdLogEntry, with_wstats=False):
         if e is None:
             return '     --     '
         d = e.timedelta - s.event('created').timedelta
-        return f"+{d.seconds:d}.{d.microseconds:06d} {self.wstats.in_use_at(e.timedelta):2}w"
+        if with_wstats and self.wstats.has_data():
+            return f"+{d.seconds:d}.{d.microseconds:06d} {self.wstats.in_use_at(e.timedelta):2}w"
+        else:
+            return f"+{d.seconds:d}.{d.microseconds:06d}"
+
+    def _error(self, s: H2StreamEvents, e: HttpdLogEntry, with_wstats=False):
+        err = 0
+        if e is not None:
+            m = re.match(r'.*error=(\d+),.*', e.message)
+            err = int(m.group(1))
+        return err if err != 0 else '--'
 
 
 class H2WTF:

@@ -14,22 +14,27 @@ class H2StreamEvents:
 
     @staticmethod
     def global_id(m: re.Match, e: HttpdLogEntry):
-        return f"{e.pid}-{m.group('session')}-{m.group('stream')}"
+        try:
+            return f"{m.group('child')}-{m.group('session')}-{m.group('stream')}"
+        except IndexError:
+            return f"{m.group('child')}-{m.group('session')}-0"
 
     @staticmethod
     def split_gid(gid: str):
-        pid, session, stream = gid.split('-')
-        return int(pid), int(session), int(stream)
+
+        parts = gid.split('-')
+        return int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
 
     def __init__(self, gid: str):
         self.gid = gid
-        self.pid, self.session_id, self.stream_id = self.split_gid(gid)
+        self.child, self.session_id, self.stream_id = self.split_gid(gid)
         self._events = {}
         self.started = None
         self.ended = None
         self.cleanup = None
         self.destroyed = None
         self.reset = None
+        self.error = None
 
     def add_event(self, name: str, e: HttpdLogEntry):
         if name in self._events:
@@ -50,7 +55,7 @@ class H2StreamEvents:
 
 class EventMatch:
 
-    def __init__(self, event: str, pattern: re.Pattern, creating=False, aliasing=False):
+    def __init__(self, event: str, pattern: str, creating=False, aliasing=False):
         self.pattern = re.compile(pattern)
         self.event = event
         self.creating = creating
@@ -65,27 +70,42 @@ class EventMatch:
 
 class H2StreamEventsCollector:
 
-    RE_SSID = r'(?P<session>\d+)-(?P<stream>\d+)'
+    RE_SID = r'(?P<child>\d+)-(?P<session>\d+)'
+    RE_SSID = RE_SID + r'-(?P<stream>\d+)'
     RE_STREAM_CREATED = r'AH03082: h2_stream\(' + RE_SSID + r',IDLE\): created'
-    RE_STREAM_SCHEDULE = r'h2_stream\(' + RE_SSID + r',.*\): schedule (?P<request>.*) chunked.*'
-    RE_STREAM_STARTED = r'h2_task\(' + RE_SSID + r'\): process connection'
+    RE_STREAM_SCHEDULE = r'h2_stream\(' + RE_SSID + r',\S+\): process, added to q'
+    RE_STREAM_STARTED = r'.*h2_c2\(' + RE_SSID + r'\): process connection'
     RE_STREAM_ENDED = r'h2_mplx\(' + RE_SSID + r'\): request done, \d+.\d+ ms elapsed'
-    RE_STREAM_CLEANUP = r'h2_stream\(' + RE_SSID + r',CLEANUP\): cleanup.*'
-    RE_STREAM_DESTROYED = r'h2_stream\(' + RE_SSID + r',CLEANUP\): destroy.*'
+    RE_STREAM_CLOSED1 = r'AH10303: h2_stream\(' + RE_SSID + r',\S+\): sent FRAME\[HEADERS.*eos=1]].*'
+    RE_STREAM_CLOSED2 = r'AH10303: h2_stream\(' + RE_SSID + r',\S+\): sent FRAME\[DATA.*flags=1, .*]].*'
+    RE_STREAM_CLEANUP = r'h2_stream\(' + RE_SSID + r',CLEANUP\): cleanup'
     RE_STREAM_RESET = r'AH03067: h2_stream\(' + RE_SSID + r'\): RST_STREAM .*'
-    RE_STREAM_FRAME = r'AH0306[68]: h2_session\((?P<session>\d+).*FRAME\[.*stream=(?P<stream>\d+).*'
+    RE_STREAM_RESET2 = r'h2_stream\(' + RE_SSID + r',\S+\): reset, error=\d+'
+    RE_STREAM_SUBMIT = r'AH03073: h2_stream\(' + RE_SSID + r',\S+\): submit response (?P<status>\d+)'
 
+    RE_SESSION_CLEANUP = r'AH03078: h2_session\(' + RE_SID + r',DONE,\d+\): .*'
+    RE_SESSION_ERROR = r'AH03068: h2_session\(' + RE_SID + r',DONE,\d+\): sent FRAME\[GOAWAY\[error=(?P<error>\d+), .*'
+
+    RE_STREAM_FRAME = r'AH0306[68]: h2_session\(' + RE_SID + '\).*FRAME\[.*stream=(?P<stream>\d+).*'
+    RE_STREAM_FRAME2 = r'AH1030[23]: h2_stream\(' + RE_SSID + ',\S+\).*FRAME\[.*'
 
     LIFETIME_MATCHER = [
         EventMatch(event='created', pattern=RE_STREAM_CREATED, creating=True),
         EventMatch(event='scheduled', pattern=RE_STREAM_SCHEDULE),
-        EventMatch(event='started', pattern=RE_STREAM_STARTED, aliasing=True),
+        EventMatch(event='started', pattern=RE_STREAM_STARTED),
+        EventMatch(event='response', pattern=RE_STREAM_SUBMIT, aliasing=True),
         EventMatch(event='ended', pattern=RE_STREAM_ENDED),
+        EventMatch(event='ended', pattern=RE_STREAM_CLOSED1),
+        EventMatch(event='ended', pattern=RE_STREAM_CLOSED2),
         EventMatch(event='cleanup', pattern=RE_STREAM_CLEANUP),
-        EventMatch(event='destroyed', pattern=RE_STREAM_DESTROYED),
         EventMatch(event='reset', pattern=RE_STREAM_RESET),
+        EventMatch(event='reset', pattern=RE_STREAM_RESET2),
+
+        EventMatch(event='cleanup', pattern=RE_SESSION_CLEANUP),
+        EventMatch(event='error', pattern=RE_SESSION_ERROR),
     ]
     FRAME_MATCHER = EventMatch(event='frame', pattern=RE_STREAM_FRAME)
+    FRAME_MATCHER2 = EventMatch(event='frame', pattern=RE_STREAM_FRAME2)
 
     def __init__(self, with_frames=False, for_streams: Optional[List[str]] = None):
         self._streams_by_gid = {}
@@ -93,6 +113,7 @@ class H2StreamEventsCollector:
         self._matcher = self.LIFETIME_MATCHER.copy()
         if with_frames:
             self._matcher.append(self.FRAME_MATCHER)
+            self._matcher.append(self.FRAME_MATCHER2)
         self._for_streams = self._gid_patterns_for(for_streams)
 
     @staticmethod
@@ -104,7 +125,9 @@ class H2StreamEventsCollector:
             if re.match(r'^\d+-\d+-\d+$', s):
                 patterns.append(re.compile(r'^' + s + r'$'))
             elif re.match(r'\d+-\d+', s):
-                patterns.append(re.compile(r'^\d+-' + s + r'$'))
+                patterns.append(re.compile(r'^' + s + r'-\d+$'))
+            elif re.match(r'\d+-', s):
+                patterns.append(re.compile(r'^' + s + '\d+-\d+$'))
             else:
                 patterns.append(re.compile(r'^\d+-\d+-' + s + r'$'))
         return patterns
@@ -115,7 +138,7 @@ class H2StreamEventsCollector:
         # do not match the stream id used on the main connection.
         pid, session, stream_id = H2StreamEvents.split_gid(gid)
         candidates = list(s for s in self._streams_by_gid.values()
-                          if s.stream_id == stream_id and s.pid == pid)
+                          if s.stream_id == stream_id and s.child == pid)
         if len(candidates) == 1:
             self._gid_by_alias[gid] = candidates[0].gid
             log.info(f"task {gid} attached to stream {candidates[0].gid}")

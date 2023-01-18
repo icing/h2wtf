@@ -78,17 +78,18 @@ class H2StreamLifetimeTable:
         print(title)
         print(f"{'id':16} {'created':<28} {'scheduled':^18} {'started':^18} "
               f"{'response':^18} {'ended':^18} {'reset':^18} {'cleanup':^18} "
-              f"{'error':>7}")
+              f"{'error':>7} {'cclose':>12}")
         for s in streams:
             print(f"{s.gid:16} "
                   f"{self.tabs(s, 'created')}"
-                  f"{self.tdelta(s, s.event('scheduled')):>18} "
-                  f"{self.tdelta(s, s.event('started'), with_wstats=True):>18} "
-                  f"{self.tdelta(s, s.event('response')):>18} "
-                  f"{self.tdelta(s, s.event('ended'), with_wstats=True):>18} "
-                  f"{self.tdelta(s, s.event('reset')):>18} "
+                  f"{self.stdelta(s, s.event('scheduled')):>18} "
+                  f"{self.stdelta(s, s.event('started'), with_wstats=True):>18} "
+                  f"{self._resp(s, s.event('response')):>18} "
+                  f"{self.stdelta(s, s.event('ended'), with_wstats=True):>18} "
+                  f"{self.stdelta(s, s.event('reset')):>18} "
                   f"{self.tdelta(s, s.event('cleanup')):>18} "
                   f"{self._error(s, s.event('error')):>7} "
+                  f"{self._cclose(s, streams):>12} "
                   )
 
     def tabs(self, s: H2StreamEvents, name: str, with_wstats=False):
@@ -100,6 +101,11 @@ class H2StreamLifetimeTable:
         else:
             return f"{str(e.timestamp)}"
 
+    def stdelta(self, s: H2StreamEvents, e: HttpdLogEntry, with_wstats=False):
+        if e is None:
+            return '*' if s.is_conn else '--'
+        return self.tdelta(s, e, with_wstats=with_wstats)
+
     def tdelta(self, s: H2StreamEvents, e: HttpdLogEntry, with_wstats=False):
         if e is None:
             return '     --     '
@@ -109,12 +115,41 @@ class H2StreamLifetimeTable:
         else:
             return f"+{d.seconds:d}.{d.microseconds:06d}"
 
-    def _error(self, s: H2StreamEvents, e: HttpdLogEntry, with_wstats=False):
+    def _error(self, s: H2StreamEvents, e: HttpdLogEntry):
         err = 0
         if e is not None:
             m = re.match(r'.*error=(\d+),.*', e.message)
             err = int(m.group(1))
-        return err if err != 0 else '--'
+            if err != 0:
+                d = e.timedelta - s.event('created').timedelta
+                return f"{err} +{d.seconds:d}.{d.microseconds:06d}"
+        return '--'
+
+    def _cclose(self, s: H2StreamEvents, streams: List[H2StreamEvents]):
+        err = 0
+        if s.is_conn:
+            return '*'
+        chid, cid, sid = s.split_gid(s.gid)
+        conn_gid = f'{chid}-{cid}-0'
+        screated = s.event('created')
+        if screated is not None:
+            for cs in streams:
+                if not cs.is_conn or cs.gid != conn_gid:
+                    continue
+                e = cs.event('cleanup')
+                if e is not None:
+                    d = e.timedelta - screated.timedelta
+                    return f"{d.seconds:d}.{d.microseconds:06d}"
+                break
+        return '--'
+
+    def _resp(self, s: H2StreamEvents, e: HttpdLogEntry):
+        if e is None:
+            return '*' if s.is_conn else '--'
+        m = re.match(r'.*submit response (?P<status>\d+).*', e.message)
+        status = m.group('status') if m else '???'
+        d = e.timedelta - s.event('created').timedelta
+        return f"{status} +{d.seconds:d}.{d.microseconds:06d}"
 
 
 class H2WTF:

@@ -27,6 +27,7 @@ class H2StreamEvents:
 
     def __init__(self, gid: str):
         self.gid = gid
+        self.is_conn = self.gid.endswith('-0')
         self.child, self.session_id, self.stream_id = self.split_gid(gid)
         self._events = {}
         self.started = None
